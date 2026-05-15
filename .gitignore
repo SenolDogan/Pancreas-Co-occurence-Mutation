@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Large transient outputs (regenerate with run_pipeline.py)
+analysis/tumor/*.tmp
+*.tmp.docx
+analysis/tumor/~$*
+analysis/tumor/_EXTRACT_*
+analysis/tumor/__pycache__/
+**/__pycache__/
+
+# Optional: uncomment if you prefer not to version the merged cohort file
+# data/Merged.xlsx
+# analysis/tumor/Merged.xlsx
