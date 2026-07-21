@@ -42,6 +42,8 @@ FIGURES = [
     "Supplementary Figure 10. Pathway-oriented functional validation summary",
     "Supplementary Figure 11. Deceased-versus-living comprehensive mutation enrichment overview",
     "Supplementary Figure 12. Multivariable Cox internal validation summary by stage",
+    "Supplementary Figure 13. Three-layer analytical decision schematic for the discovery cohort.",
+    "Supplementary Figure 14. Kaplan–Meier overall survival for TP53+KRAS carriers versus others (integrated discovery cohort).",
 ]
 
 TABLES = [
@@ -163,11 +165,14 @@ def rebuild_inventory(doc: Document, intro_idx: int) -> None:
         delete_paragraph(paras[start])
 
     items: list[str] = []
+    fig_start = 10
+    tbl_start = fig_start + len(FIGURES)
+    max_item = 9 + len(FIGURES) + len(TABLES)
     for n, line in enumerate(METHODS, start=1):
         items.append(f"{n}. {line}")
-    for n, line in enumerate(FIGURES, start=10):
+    for n, line in enumerate(FIGURES, start=fig_start):
         items.append(f"{n}. {line}")
-    for n, line in enumerate(TABLES, start=22):
+    for n, line in enumerate(TABLES, start=tbl_start):
         items.append(f"{n}. {line}")
 
     intro_p = doc.paragraphs[intro_idx]
@@ -200,11 +205,17 @@ def main() -> None:
 
     # Update intro
     if intro_idx is not None:
+        fig_start = 10
+        tbl_start = fig_start + len(FIGURES)
+        max_item = 9 + len(FIGURES) + len(TABLES)
+        fig_end = fig_start + len(FIGURES) - 1
+        tbl_end = tbl_start + len(TABLES) - 1
         set_para_text(
             doc.paragraphs[intro_idx],
-            "The following supplementary items accompany the main manuscript and are numbered sequentially "
-            "(items 1–32): Supplementary Methods (items 1–9), Supplementary Figures (items 10–21), and "
-            "Supplementary Tables (items 22–32). Extended content is provided in separate files "
+            f"The following supplementary items accompany the main manuscript and are numbered sequentially "
+            f"(items 1–{max_item}): Supplementary Methods (items 1–9), Supplementary Figures (items "
+            f"{fig_start}–{fig_end}), and Supplementary Tables (items {tbl_start}–{tbl_end}). Extended content "
+            "is provided in separate files "
             "(Supplementary Methods.docx; Supplementary Figures.docx; Supplementary Tables.xlsx).",
         )
 
@@ -216,8 +227,9 @@ def main() -> None:
             t = normalize_supplementary_citations(p.text)
             set_para_text(p, t)
 
+    max_item_total = 9 + len(FIGURES) + len(TABLES)
     doc.save(str(path))
-    print(f"Normalized {n_norm} body paragraphs; rebuilt inventory 1–32 in {path}")
+    print(f"Normalized {n_norm} body paragraphs; rebuilt inventory 1–{max_item_total} in {path}")
 
 
 if __name__ == "__main__":

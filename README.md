@@ -59,6 +59,15 @@ Word-only helpers (citations, supplementary numbering, figure embedding) live in
 - `restore_manuscript_figures.py` — embed PNGs above legends in `manuscript/NewManuscript.docx`
 - `fix_supplementary_sequential_order.py` — supplementary Methods/Figures/Tables citation order
 - `audit_supplementary_references.py` — check in-text vs end-matter inventory
+- `nat_commun_boost_analyses.py` — Kaplan–Meier, discovery Cox, feasibility report (Nat Commun)
+- `cbioportal_pdac_validation_report.py` — 5 dual pairs × 4 cBioPortal cohorts HR table
+- `sync_supplementary_figures_file_and_manuscript.py` — SF13–14 into `analysis/tumor/supplementary/Supplementary Figures.docx`
+- `move_nat_commun_figures_to_supplementary.py` — move schematic/KM from main text to supplementary inventory
+
+Submission documents in `manuscript/`:
+
+- `NewManuscript.docx` — main draft
+- `CoAuthor_Profiles_NatureCommunications.docx` — co-author profiles for editors/reviewers
 
 ## Data and ethics
 

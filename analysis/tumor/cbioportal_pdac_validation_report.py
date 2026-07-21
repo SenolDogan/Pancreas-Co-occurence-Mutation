@@ -47,6 +47,22 @@ GENE_TO_ENTREZ: Dict[str, int] = {
 GENES = list(GENE_TO_ENTREZ.keys())
 ENTREZ_TO_GENE = {v: k for k, v in GENE_TO_ENTREZ.items()}
 
+# Prespecified dual pairs (discovery Table 3 / Nat Commun extension)
+DUAL_PAIRS: List[Tuple[str, str]] = [
+    ("TP53", "KRAS"),
+    ("TP53", "SMAD4"),
+    ("TP53", "ARID1A"),
+    ("KRAS", "ARID1A"),
+    ("TP53", "CDKN2A"),
+]
+STUDY_LABELS: Dict[str, str] = {
+    "paad_tcga_gdc": "TCGA PAAD (GDC 2025)",
+    "paad_tcga_pan_can_atlas_2018": "TCGA Pan-Cancer Atlas",
+    "pancreas_cptac_gdc": "CPTAC Pancreatic (GDC 2025)",
+    "pdac_msk_2024": "MSK PDAC (Nat Med 2024)",
+    "DISCOVERY": "Primary integrated cohort",
+}
+
 
 def http_get(url: str, timeout: int = 180) -> Any:
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -176,14 +192,35 @@ def mutations_to_patient_genes(mut_rows: List[dict]) -> Dict[str, Set[str]]:
     return by_patient
 
 
-def discovery_reference(merged_xlsx: Path) -> Tuple[int, Dict[str, float], float, float, float]:
+def combo_label(g1: str, g2: str) -> str:
+    return f"{g1}+{g2}"
+
+
+def fit_univariate_cox(cdf: pd.DataFrame, cov_col: str) -> Tuple[float, float, float, float, int, str]:
+    """Return HR, CI lo, CI hi, p, n_cox, note."""
+    hr = lo = hi = pval = float("nan")
+    note = ""
+    n_cox = int(len(cdf))
+    if n_cox < 15 or cdf[cov_col].sum() == 0 or (cdf[cov_col] == 0).sum() == 0:
+        note = "Cox not fitted (sparse strata or N too small after OS filter)."
+        return hr, lo, hi, pval, n_cox, note
+    from lifelines import CoxPHFitter
+
+    cph = CoxPHFitter()
+    cph.fit(cdf, duration_col="OS_MONTHS", event_col="event")
+    hr = float(np.exp(cph.params_[cov_col]))
+    lo, hi = [float(x) for x in np.exp(cph.confidence_intervals_.loc[cov_col])]
+    pval = float(cph.summary.loc[cov_col, "p"])
+    return hr, lo, hi, pval, n_cox, note
+
+
+def discovery_reference(merged_xlsx: Path) -> Tuple[int, Dict[str, float], List[dict]]:
     df = pd.read_excel(merged_xlsx, usecols=["PATIENT_ID", "Hugo_Symbol", "OS_MONTHS", "OS_STATUS"])
     muts = df.groupby("PATIENT_ID")["Hugo_Symbol"].apply(lambda s: set(s.dropna().astype(str)))
     clin = df.groupby("PATIENT_ID").first()
     patients = list(clin.index)
     n = len(patients)
     freq = {g: sum(g in muts[p] for p in patients) / n * 100 for g in GENES}
-    both_pct = sum(("TP53" in muts[p]) and ("KRAS" in muts[p]) for p in patients) / n * 100
 
     rows = []
     for pid in patients:
@@ -191,24 +228,40 @@ def discovery_reference(merged_xlsx: Path) -> Tuple[int, Dict[str, float], float
         om = pd.to_numeric(clin.loc[pid, "OS_MONTHS"], errors="coerce")
         st = str(clin.loc[pid, "OS_STATUS"])
         ev = 1 if st == "1:DECEASED" else 0
-        rows.append({"OS_MONTHS": om, "event": ev, "both": 1 if ("TP53" in g and "KRAS" in g) else 0})
+        rec: dict = {"OS_MONTHS": om, "event": ev}
+        for g1, g2 in DUAL_PAIRS:
+            rec[combo_label(g1, g2)] = 1 if (g1 in g and g2 in g) else 0
+        rows.append(rec)
     cdf = pd.DataFrame(rows).dropna(subset=["OS_MONTHS"])
     cdf = cdf[cdf["OS_MONTHS"] > 0]
-    from lifelines import CoxPHFitter
 
-    cph = CoxPHFitter()
-    cph.fit(cdf, duration_col="OS_MONTHS", event_col="event")
-    hr = float(np.exp(cph.params_["both"]))
-    lo, hi = [float(x) for x in np.exp(cph.confidence_intervals_.loc["both"])]
-    pval = float(cph.summary.loc["both", "p"])
-    return n, freq, both_pct, hr, pval
+    pair_rows: List[dict] = []
+    for g1, g2 in DUAL_PAIRS:
+        lab = combo_label(g1, g2)
+        prev = float(cdf[lab].mean() * 100)
+        hr, lo, hi, pval, n_cox, note = fit_univariate_cox(cdf, lab)
+        pair_rows.append(
+            {
+                "study_id": "DISCOVERY",
+                "study_label": STUDY_LABELS["DISCOVERY"],
+                "dual_pair": lab,
+                "n_patients_clinical": n,
+                "n_cox": n_cox,
+                "combo_prevalence_pct": prev,
+                "hr": hr,
+                "ci_lo": lo,
+                "ci_hi": hi,
+                "p_value": pval,
+                "cox_note": note,
+            }
+        )
+    return n, freq, pair_rows
 
 
 def external_cohort_stats(
     study_id: str, mut_profile: str, sample_list_id: str, clin: pd.DataFrame, mut_rows: List[dict]
-) -> dict:
+) -> Tuple[dict, List[dict]]:
     by_p = mutations_to_patient_genes(mut_rows)
-    # restrict to patients with clinical OS rows
     clin = clin[clin["studyId"] == study_id].copy() if "studyId" in clin.columns else clin
     clin["OS_MONTHS"] = pd.to_numeric(clin["OS_MONTHS"], errors="coerce")
 
@@ -223,46 +276,50 @@ def external_cohort_stats(
     clin["event"] = clin["OS_STATUS"].map(parse_event)
     pids = clin["PATIENT_ID"].astype(str).tolist()
     n = len(pids)
-    freq = {}
-    for g in GENES:
-        freq[g] = sum(g in by_p.get(p, set()) for p in pids) / max(n, 1) * 100
-    both_pct = sum(("TP53" in by_p.get(p, set())) and ("KRAS" in by_p.get(p, set())) for p in pids) / max(n, 1) * 100
+    freq = {g: sum(g in by_p.get(p, set()) for p in pids) / max(n, 1) * 100 for g in GENES}
 
     rows = []
     for _, r in clin.iterrows():
         pid = str(r["PATIENT_ID"])
         genes = by_p.get(pid, set())
-        om = r["OS_MONTHS"]
-        ev = int(bool(r["event"]))
-        rows.append({"OS_MONTHS": om, "event": ev, "both": 1 if ("TP53" in genes and "KRAS" in genes) else 0})
+        rec: dict = {"OS_MONTHS": r["OS_MONTHS"], "event": int(bool(r["event"]))}
+        for g1, g2 in DUAL_PAIRS:
+            rec[combo_label(g1, g2)] = 1 if (g1 in genes and g2 in genes) else 0
+        rows.append(rec)
     cdf = pd.DataFrame(rows).dropna(subset=["OS_MONTHS"])
     cdf = cdf[cdf["OS_MONTHS"] > 0]
-    hr = lo = hi = pval = float("nan")
-    cox_note = ""
-    if len(cdf) >= 15 and cdf["both"].sum() > 0 and (cdf["both"] == 0).sum() > 0:
-        from lifelines import CoxPHFitter
 
-        cph = CoxPHFitter()
-        cph.fit(cdf, duration_col="OS_MONTHS", event_col="event")
-        hr = float(np.exp(cph.params_["both"]))
-        lo, hi = [float(x) for x in np.exp(cph.confidence_intervals_.loc["both"])]
-        pval = float(cph.summary.loc["both", "p"])
-    else:
-        cox_note = "Cox not fitted (sparse both-strata or N too small after OS filter)."
+    pair_rows: List[dict] = []
+    for g1, g2 in DUAL_PAIRS:
+        lab = combo_label(g1, g2)
+        prev = float(cdf[lab].mean() * 100) if len(cdf) else float("nan")
+        hr, lo, hi, pval, n_cox, note = fit_univariate_cox(cdf, lab)
+        pair_rows.append(
+            {
+                "study_id": study_id,
+                "study_label": STUDY_LABELS.get(study_id, study_id),
+                "dual_pair": lab,
+                "n_patients_clinical": n,
+                "n_cox": n_cox,
+                "combo_prevalence_pct": prev,
+                "hr": hr,
+                "ci_lo": lo,
+                "ci_hi": hi,
+                "p_value": pval,
+                "cox_note": note,
+            }
+        )
 
-    return {
+    meta = {
         "study_id": study_id,
         "n_patients_clinical": n,
         "n_cox": int(len(cdf)),
         "freq": freq,
-        "both_pct": both_pct,
-        "hr_tp53kras": hr,
-        "ci_lo": lo,
-        "ci_hi": hi,
-        "p_tp53kras": pval,
-        "cox_note": cox_note,
         "n_patients_any_mutation_record": len(by_p),
+        "sample_list_id": sample_list_id,
+        "mutation_profile_id": mut_profile,
     }
+    return meta, pair_rows
 
 
 def main() -> int:
@@ -280,13 +337,21 @@ def main() -> int:
     ]
 
     print("Loading discovery reference from Merged.xlsx …")
-    n_d, f_d, both_d, hr_d, p_d = discovery_reference(merged)
-    print(f"Discovery N={n_d}, TP53+KRAS%={both_d:.1f}, Cox HR={hr_d:.2f}, p={p_d:.3g}\n")
+    n_d, f_d, disc_pairs = discovery_reference(merged)
+    tp53_kras_d = next(r for r in disc_pairs if r["dual_pair"] == "TP53+KRAS")
+    print(
+        f"Discovery N={n_d}, TP53+KRAS%={tp53_kras_d['combo_prevalence_pct']:.1f}, "
+        f"Cox HR={tp53_kras_d['hr']:.2f}, p={tp53_kras_d['p_value']:.3g}\n"
+    )
 
+    all_rows: List[dict] = list(disc_pairs)
     lines: List[str] = []
     lines.append("# cBioPortal four-study validation summary\n")
     lines.append(f"- Discovery: Tumor/Merged.xlsx (N={n_d})\n")
-    lines.append(f"- Discovery TP53+KRAS Cox HR={hr_d:.2f}, p={p_d:.3g}\n\n")
+    lines.append(
+        f"- Discovery TP53+KRAS Cox HR={tp53_kras_d['hr']:.2f}, p={tp53_kras_d['p_value']:.3g}\n"
+    )
+    lines.append("- Extended dual-pair Cox table: `Validation_cBioPortal_FivePairs_FourStudies.xlsx`\n\n")
 
     for sid in studies:
         print(f"=== {sid} ===")
@@ -298,31 +363,57 @@ def main() -> int:
         print(f"  mutation rows: {len(muts)}")
         print("  fetching clinical OS …")
         clin = fetch_patient_clinical_os(sid)
-        stats = external_cohort_stats(sid, mp, sl, clin, muts)
+        meta, pair_rows = external_cohort_stats(sid, mp, sl, clin, muts)
+        all_rows.extend(pair_rows)
+        tk = next(r for r in pair_rows if r["dual_pair"] == "TP53+KRAS")
         print(
-            f"  N clinical={stats['n_patients_clinical']}, N cox={stats['n_cox']}, "
-            f"TP53+KRAS%={stats['both_pct']:.1f}, HR={stats['hr_tp53kras']:.3f}, "
-            f"p={stats['p_tp53kras']:.3g} {stats['cox_note']}"
+            f"  N clinical={meta['n_patients_clinical']}, N cox={meta['n_cox']}, "
+            f"TP53+KRAS%={tk['combo_prevalence_pct']:.1f}, HR={tk['hr']:.3f}, "
+            f"p={tk['p_value']:.3g} {tk['cox_note']}"
         )
 
         lines.append(f"## {sid}\n")
         lines.append(f"- Sequenced sample list: `{sl}`\n")
         lines.append(f"- Mutation profile: `{mp}`\n")
-        lines.append(f"- Patients with OS fields: {stats['n_patients_clinical']}\n")
-        lines.append(f"- Patients used in Cox (OS>0): {stats['n_cox']}\n")
-        lines.append(f"- TP53+KRAS prevalence: **{stats['both_pct']:.1f}%** (discovery {both_d:.1f}%)\n")
+        lines.append(f"- Patients with OS fields: {meta['n_patients_clinical']}\n")
+        lines.append(f"- Patients used in Cox (OS>0): {meta['n_cox']}\n")
         lines.append(
-            f"- Univariate Cox TP53+KRAS vs others: HR **{stats['hr_tp53kras']:.3f}** "
-            f"95% CI [{stats['ci_lo']:.3f}, {stats['ci_hi']:.3f}], p **{stats['p_tp53kras']:.3g}** {stats['cox_note']}\n"
+            f"- TP53+KRAS prevalence: **{tk['combo_prevalence_pct']:.1f}%** "
+            f"(discovery {tp53_kras_d['combo_prevalence_pct']:.1f}%)\n"
         )
         lines.append(
-            f"- KRAS%={stats['freq']['KRAS']:.1f} TP53%={stats['freq']['TP53']:.1f} "
-            f"CDKN2A%={stats['freq']['CDKN2A']:.1f} SMAD4%={stats['freq']['SMAD4']:.1f}\n\n"
+            f"- Univariate Cox TP53+KRAS vs others: HR **{tk['hr']:.3f}** "
+            f"95% CI [{tk['ci_lo']:.3f}, {tk['ci_hi']:.3f}], p **{tk['p_value']:.3g}** {tk['cox_note']}\n"
         )
+        lines.append(
+            f"- KRAS%={meta['freq']['KRAS']:.1f} TP53%={meta['freq']['TP53']:.1f} "
+            f"CDKN2A%={meta['freq']['CDKN2A']:.1f} SMAD4%={meta['freq']['SMAD4']:.1f}\n"
+        )
+        lines.append("\n| Dual pair | Prev% | HR | 95% CI | p |\n")
+        lines.append("|---|---:|---:|---|---:|\n")
+        for pr in pair_rows:
+            lines.append(
+                f"| {pr['dual_pair']} | {pr['combo_prevalence_pct']:.1f} | "
+                f"{pr['hr']:.3f} | [{pr['ci_lo']:.3f}, {pr['ci_hi']:.3f}] | {pr['p_value']:.3g} |\n"
+            )
+        lines.append("\n")
+
+    tbl = pd.DataFrame(all_rows)
+    out_xlsx = tumor_dir / "Validation_cBioPortal_FivePairs_FourStudies.xlsx"
+    pivot_hr = tbl.pivot_table(
+        index="dual_pair", columns="study_id", values="hr", aggfunc="first"
+    )
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
+        tbl.to_excel(w, sheet_name="All_rows", index=False)
+        pivot_hr.to_excel(w, sheet_name="HR_pivot")
+        tbl.pivot_table(
+            index="dual_pair", columns="study_id", values="p_value", aggfunc="first"
+        ).to_excel(w, sheet_name="P_pivot")
 
     out_md = tumor_dir / "Validation_cBioPortal_FourStudies_Report.md"
     out_md.write_text("".join(lines), encoding="utf-8")
     print(f"\nWrote {out_md}")
+    print(f"Wrote {out_xlsx} ({len(tbl)} rows)")
     return 0
 
 
